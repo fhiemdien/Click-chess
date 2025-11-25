@@ -291,14 +291,52 @@ const App = () => {
 
   const movesUntilNextSwap = 30 - (turnCount % 30);
 
+  // Refs for resolving stale closures in PeerJS callbacks
+  const boardRef = useRef(board);
+  const scoresRef = useRef(scores);
+  const currentPlayerRef = useRef(currentPlayer);
+  const humanColorRef = useRef(humanColor);
+  const turnCountRef = useRef(turnCount);
+  const gameModeRef = useRef(gameMode);
+  
+  // Keep refs synced
+  useEffect(() => { boardRef.current = board; }, [board]);
+  useEffect(() => { scoresRef.current = scores; }, [scores]);
+  useEffect(() => { currentPlayerRef.current = currentPlayer; }, [currentPlayer]);
+  useEffect(() => { humanColorRef.current = humanColor; }, [humanColor]);
+  useEffect(() => { turnCountRef.current = turnCount; }, [turnCount]);
+  useEffect(() => { gameModeRef.current = gameMode; }, [gameMode]);
+
   const playSound = (type: 'click' | 'clear') => {};
 
   useEffect(() => {
+    // Check for auto-join URL param
+    const params = new URLSearchParams(window.location.search);
+    const joinId = params.get('join');
+
+    if (joinId && !peer) {
+        setConnectToId(joinId);
+        setGameMode('ONLINE');
+        setOnlineStatus('WAITING');
+        
+        const newPeer = new Peer();
+        setPeer(newPeer);
+        
+        newPeer.on('open', (id) => {
+            setMyPeerId(id);
+            // Auto connect to host
+            const connection = newPeer.connect(joinId);
+            setConn(connection);
+            setOnlinePlayerColor(PLAYER_WHITE); // Guest is White/P2
+            setHumanColor(PLAYER_WHITE); 
+            setupConnectionHandlers(connection);
+        });
+    }
+
     return () => {
-      // Cleanup peer on unmount
       if (peer) peer.destroy();
     };
-  }, [peer]);
+  }, []);
 
   const resetGame = () => {
     setBoard(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY)));
@@ -328,8 +366,6 @@ const App = () => {
           // Host is Player 1 (Black/Void)
           setOnlinePlayerColor(PLAYER_BLACK);
           setHumanColor(PLAYER_BLACK);
-      } else {
-          // Guest logic handles connection below
       }
     });
 
@@ -351,16 +387,44 @@ const App = () => {
     setupConnectionHandlers(connection);
   };
 
+  // We use a ref for processTurn to ensure connection handlers always call the latest version
+  // Or we simply pass data to a handler that reads from refs.
+  const processTurnRef = useRef<any>(null);
+  
   const setupConnectionHandlers = (connection: DataConnection) => {
       connection.on('open', () => {
           setOnlineStatus('CONNECTED');
       });
       connection.on('data', (data: any) => {
           if (data && data.type === 'MOVE') {
-              // Received move from opponent
-              handleRemoteMove(data.r, data.c);
+              // Read latest state from refs
+              const r = data.r;
+              const c = data.c;
+              const currentBoard = boardRef.current;
+              const currentCP = currentPlayerRef.current;
+              
+              if (currentBoard[r][c] !== EMPTY) return; // Should not happen
+
+              const newBoard = currentBoard.map(row => [...row]);
+              newBoard[r][c] = currentCP;
+              
+              setBoard(newBoard);
+              setLastMove({r, c});
+              playSound('click');
+
+              // Call process turn using REF values
+              if (processTurnRef.current) {
+                processTurnRef.current(
+                    newBoard, 
+                    r, c, 
+                    currentCP, 
+                    humanColorRef.current, 
+                    scoresRef.current, 
+                    turnCountRef.current
+                );
+              }
           } else if (data && data.type === 'RESET') {
-             resetGame(); // Allow opponent to trigger reset
+             resetGame(); 
           }
       });
       connection.on('close', () => {
@@ -373,42 +437,6 @@ const App = () => {
           alert('Lỗi kết nối!');
       });
   };
-
-  const handleRemoteMove = (r: number, c: number) => {
-      // Need access to latest state, so we use functional updates in processTurn if needed
-      // But simpler here: get latest board state via ref or relying on closure if component updates
-      // React state closure is tricky. For simplicity, we use the `board` from state but we need to be careful.
-      // Actually, since this is an event handler, it might see stale state.
-      // Best way: Use a ref for the board or simply pass the updater to setBoard.
-      // HOWEVER, `processTurn` needs the CURRENT board.
-      
-      // Let's use a workaround: dispatch an event or use a ref. 
-      // For this specific app structure, let's trust React's rerender for now, 
-      // but note that 'data' listener needs to be refreshed or access refs.
-      // To fix stale closures in `setupConnectionHandlers`, we should use a ref for the handlers or `useEffect` dependency.
-      
-      // FIX: trigger a state update that handles the move
-      setLastRemoteMove({r, c});
-  };
-
-  // Helper to trigger remote move processing when state updates
-  const [lastRemoteMove, setLastRemoteMove] = useState<{r:number, c:number} | null>(null);
-  useEffect(() => {
-      if (lastRemoteMove) {
-          const { r, c } = lastRemoteMove;
-          // Verify it's a valid move (it should be)
-          if (board[r][c] === EMPTY) {
-               const newBoard = board.map(row => [...row]);
-               newBoard[r][c] = currentPlayer;
-               setBoard(newBoard);
-               setLastMove({ r, c });
-               playSound('click');
-               processTurn(newBoard, r, c, currentPlayer, humanColor, scores, turnCount);
-          }
-          setLastRemoteMove(null);
-      }
-  }, [lastRemoteMove]);
-
 
   const processTurn = useCallback((
       newBoard: BoardState, 
@@ -427,35 +455,7 @@ const App = () => {
     
      if (stonesToExplode && stonesToExplode.length > 0) {
        const points = stonesToExplode.length;
-       // Logic for point attribution:
-       // If I moved, and it exploded, OPPONENT gets points.
-       // Who is 'I' in PVE/PVP?
-       // In PVE: isP1Move = playerWhoMoved === currentHumanColor
-       // In ONLINE: P1 is Host, P2 is Guest. 
-       // We track P1/P2 scores directly. 
-       // If PLAYER_BLACK moved -> P1 moved. If PLAYER_WHITE moved -> P2 moved.
-       
-       // BUT, due to swapping, Player 1 might be holding White.
-       // Let's rely on who made the move.
-       // We need to know who is 'P1' and who is 'P2' conceptually.
-       // In this game logic:
-       // P1 starts with Black.
-       // P2 starts with White.
-       // When swapped: P1 holds White, P2 holds Black.
-       
-       // Score logic update:
-       // If the player who moved is currently P1 -> P2 gets points.
-       // If the player who moved is currently P2 -> P1 gets points.
-       
-       // Check if the current player (who moved) is P1 or P2.
-       // Logic: 
-       // Initial: P1=Black, P2=White.
-       // Swap 1 (30 moves): P1=White, P2=Black.
-       // Swap 2 (60 moves): P1=Black, P2=White.
-       // So: if (turnCount / 30) is even (0, 2..), P1 is Black.
-       // If (turnCount / 30) is odd (1, 3..), P1 is White.
-       
-       const cycle = Math.floor(currentTurnBase / 30); // Use PREVIOUS turn count for current state
+       const cycle = Math.floor(currentTurnBase / 30);
        const p1IsBlack = cycle % 2 === 0;
        
        let isP1 = false;
@@ -526,7 +526,11 @@ const App = () => {
      } else {
         setIsAiThinking(false);
      }
-  }, [gameMode]);
+  }, [gameMode]); // gameMode dependency is fine
+
+  // Update the ref whenever processTurn changes
+  useEffect(() => { processTurnRef.current = processTurn; }, [processTurn]);
+
 
   const handleCellClick = async (r: number, c: number) => {
     if (isGameOver || isAiThinking) return;
@@ -534,13 +538,6 @@ const App = () => {
     // Permission checks
     if (gameMode === 'PVE' && currentPlayer !== humanColor) return;
     if (gameMode === 'ONLINE') {
-        // Can only move if it's my turn AND the current player matches my assigned color
-        // Note: humanColor updates on Swap. onlinePlayerColor is static (Host=P1, Guest=P2).
-        
-        // We need to check if 'I' am the one who should be moving.
-        // humanColor tracks who 'I' am currently playing as (Black/White).
-        // currentPlayer is whose turn it is (Black/White).
-        // So:
         if (currentPlayer !== humanColor) return;
     }
 
@@ -725,6 +722,7 @@ const App = () => {
                        <div className="bg-green-900/30 border border-green-800 p-2 rounded text-center">
                            <p className="text-green-400 text-xs font-bold">🟢 Đã kết nối!</p>
                            <p className="text-[10px] text-gray-400 mt-1">Bạn là: {onlinePlayerColor === PLAYER_BLACK ? 'P1 (Host)' : 'P2 (Guest)'}</p>
+                           <p className="text-[10px] text-gray-500">Mã phòng: {myPeerId || connectToId}</p>
                        </div>
                    )}
                 </div>
@@ -858,16 +856,6 @@ const App = () => {
     </div>
   );
 };
-
-// Check for join link parameter on load
-const urlParams = new URLSearchParams(window.location.search);
-const joinId = urlParams.get('join');
-// We can auto-populate the join ID if we wanted to, but for now just letting user know
-if(joinId) {
-    // Logic to handle auto join could go here, for now simpler to just let user copy paste or manual entry
-    // Or set initial state for input.
-    // We will do that in component via a prop or ref if needed, but manual entry is safer for this demo.
-}
 
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
