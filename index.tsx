@@ -513,10 +513,10 @@ const App = () => {
           <div className="bg-yellow-900/20 p-3 rounded border border-yellow-900/50 text-[10px] text-yellow-100/80 space-y-1">
             <p className="uppercase font-bold text-yellow-500">Cách chơi:</p>
             <ul className="list-disc pl-3 space-y-1">
-                <li>Tạo hàng ≥ 5 -> <strong>ĐỐI THỦ nhận điểm = số quân</strong> & xóa cờ.</li>
+                <li>Tạo hàng &ge; 5 &rarr; <strong>ĐỐI THỦ nhận điểm = số quân</strong> và xóa cờ.</li>
                 <li>Đổi màu cờ mỗi 30 lượt (icon ở bảng điểm).</li>
-                <li>Hơn 100 điểm và đạt 200 điểm -> THẮNG LUÔN.</li>
-                <li>Hòa điểm -> ai nhiều quân hơn bị TRỪ điểm.</li>
+                <li>Hơn 100 điểm và đạt 200 điểm &rarr; THẮNG LUÔN.</li>
+                <li>Hòa điểm &rarr; ai nhiều quân hơn bị TRỪ điểm.</li>
             </ul>
           </div>
           
