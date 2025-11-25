@@ -1,7 +1,5 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Constants ---
 const BOARD_SIZE = 15;
@@ -11,7 +9,7 @@ const EMPTY = 0;
 
 type CellValue = 0 | 1 | 2;
 type BoardState = CellValue[][];
-type Difficulty = 'EASY' | 'MEDIUM' | 'SUPER_STRONG' | 'HARD';
+type Difficulty = 'EASY' | 'MEDIUM' | 'SUPER_STRONG';
 type GameMode = 'PVP' | 'PVE';
 
 // --- Helper Logic ---
@@ -198,7 +196,7 @@ const getSuperStrongMove = (board: BoardState, aiPlayer: CellValue) => {
         }
     }
 
-    const opponent = aiPlayer === PLAYER_BLACK ? PLAYER_WHITE : PLAYER_BLACK;
+    // const opponent = aiPlayer === PLAYER_BLACK ? PLAYER_WHITE : PLAYER_BLACK;
     
     for (let i = 0; i < candidates.length; i++) {
         if (candidates[i].score < -5000) continue; 
@@ -233,69 +231,7 @@ const getSuperStrongMove = (board: BoardState, aiPlayer: CellValue) => {
         candidates[i].score += moveScore + Math.random() * 2;
     }
     candidates.sort((a, b) => b.score - a.score);
-    return candidates[0].move;
-};
-
-// Level 4: Extreme (Gemini API)
-const getGeminiMove = async (board: BoardState, aiPlayer: CellValue, scoreSelf: number, scoreOpponent: number): Promise<{ r: number, c: number } | null> => {
-  try {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const boardStr = JSON.stringify(board);
-    const playerColorName = aiPlayer === PLAYER_BLACK ? "Void (1)" : "Light (2)";
-    
-    const prompt = `
-      You are playing **Caro Nổ (Explosive Gomoku)**.
-      Board: 15x15.
-      
-      **CRITICAL SCORING RULE:**
-      If you form a line of **5 OR MORE** stones (5, 6, 7, 8...):
-      1. Your OPPONENT gets points equal to the number of stones.
-      2. Those stones are REMOVED from the board.
-      
-      **GOAL:** Maximize YOUR score (${scoreSelf}) relative to the opponent (${scoreOpponent}). 
-      
-      **STRATEGY:** 
-      - **DO NOT** make a line of 5+ stones yourself unless it gives you a massive tactical advantage by clearing space.
-      - **FORCE** the opponent to complete a line of 5+ stones.
-      - Avoid building long lines (3 or 4) unless you are sure they won't become 5.
-      
-      Swap Rule: Sides swap every 15 moves. currently playing **${playerColorName}**.
-      
-      Current Board (JSON): ${boardStr}
-      
-      Return best move [row, col].
-      Response JSON format: { "row": number, "col": number, "reasoning": string }
-    `;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            row: { type: Type.INTEGER },
-            col: { type: Type.INTEGER },
-            reasoning: { type: Type.STRING }
-          },
-          required: ["row", "col"]
-        }
-      }
-    });
-
-    const result = JSON.parse(response.text);
-    console.log("Gemini Reasoning:", result.reasoning);
-    
-    if (result.row >= 0 && result.row < 15 && result.col >= 0 && result.col < 15 && board[result.row][result.col] === EMPTY) {
-      return { r: result.row, c: result.col };
-    }
-    throw new Error("Invalid Gemini move");
-
-  } catch (error) {
-    console.error("Gemini failed, falling back to Strong AI:", error);
-    return getSuperStrongMove(board, aiPlayer);
-  }
+    return candidates[0]?.move || { r: 7, c: 7 };
 };
 
 const getGameResult = (
@@ -468,11 +404,10 @@ const App = () => {
     } else if (difficulty === 'MEDIUM') {
       await new Promise(resolve => setTimeout(resolve, 300));
       move = getMediumMove(currentBoard, aiPlayer);
-    } else if (difficulty === 'SUPER_STRONG') {
+    } else {
+      // Super Strong
       await new Promise(resolve => setTimeout(resolve, 500));
       move = getSuperStrongMove(currentBoard, aiPlayer);
-    } else {
-      move = await getGeminiMove(currentBoard, aiPlayer, aiScore, humanScore);
     }
 
     if (move) {
@@ -570,7 +505,6 @@ const App = () => {
                 <option value="EASY">Dễ (Random)</option>
                 <option value="MEDIUM">Trung Bình</option>
                 <option value="SUPER_STRONG">Siêu Mạnh (Local)</option>
-                <option value="HARD">Cực Khó (Gemini AI)</option>
               </select>
             )}
           </div>
