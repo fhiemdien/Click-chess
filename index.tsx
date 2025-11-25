@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
+import Peer, { DataConnection } from 'peerjs';
 
 // --- Constants ---
 const BOARD_SIZE = 15;
@@ -10,7 +11,7 @@ const EMPTY = 0;
 type CellValue = 0 | 1 | 2;
 type BoardState = CellValue[][];
 type Difficulty = 'EASY' | 'MEDIUM' | 'SUPER_STRONG';
-type GameMode = 'PVP' | 'PVE';
+type GameMode = 'PVP' | 'PVE' | 'ONLINE';
 
 // --- Helper Logic ---
 
@@ -280,9 +281,24 @@ const App = () => {
   const [removedStones, setRemovedStones] = useState<{r:number, c:number}[]>([]);
   const [hoveredCell, setHoveredCell] = useState<{r: number, c: number} | null>(null);
 
+  // --- Online Mode States ---
+  const [peer, setPeer] = useState<Peer | null>(null);
+  const [conn, setConn] = useState<DataConnection | null>(null);
+  const [myPeerId, setMyPeerId] = useState<string>('');
+  const [connectToId, setConnectToId] = useState<string>('');
+  const [onlineStatus, setOnlineStatus] = useState<'IDLE' | 'WAITING' | 'CONNECTED'>('IDLE');
+  const [onlinePlayerColor, setOnlinePlayerColor] = useState<CellValue>(PLAYER_BLACK); // My color in Online mode
+
   const movesUntilNextSwap = 30 - (turnCount % 30);
 
   const playSound = (type: 'click' | 'clear') => {};
+
+  useEffect(() => {
+    return () => {
+      // Cleanup peer on unmount
+      if (peer) peer.destroy();
+    };
+  }, [peer]);
 
   const resetGame = () => {
     setBoard(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY)));
@@ -298,6 +314,101 @@ const App = () => {
     setRemovedStones([]);
     setHoveredCell(null);
   };
+
+  const initOnlineGame = (isHost: boolean) => {
+    const newPeer = new Peer();
+    setPeer(newPeer);
+    setOnlineStatus('WAITING');
+    resetGame();
+    setGameMode('ONLINE');
+
+    newPeer.on('open', (id) => {
+      setMyPeerId(id);
+      if (isHost) {
+          // Host is Player 1 (Black/Void)
+          setOnlinePlayerColor(PLAYER_BLACK);
+          setHumanColor(PLAYER_BLACK);
+      } else {
+          // Guest logic handles connection below
+      }
+    });
+
+    newPeer.on('connection', (connection) => {
+      // Logic for HOST receiving connection
+      setConn(connection);
+      setOnlineStatus('CONNECTED');
+      setupConnectionHandlers(connection);
+    });
+  };
+
+  const joinOnlineGame = () => {
+    if (!connectToId || !peer) return;
+    const connection = peer.connect(connectToId);
+    setConn(connection);
+    // Guest is Player 2 (White/Light)
+    setOnlinePlayerColor(PLAYER_WHITE);
+    setHumanColor(PLAYER_WHITE); 
+    setupConnectionHandlers(connection);
+  };
+
+  const setupConnectionHandlers = (connection: DataConnection) => {
+      connection.on('open', () => {
+          setOnlineStatus('CONNECTED');
+      });
+      connection.on('data', (data: any) => {
+          if (data && data.type === 'MOVE') {
+              // Received move from opponent
+              handleRemoteMove(data.r, data.c);
+          } else if (data && data.type === 'RESET') {
+             resetGame(); // Allow opponent to trigger reset
+          }
+      });
+      connection.on('close', () => {
+          alert('Đối thủ đã thoát!');
+          setOnlineStatus('IDLE');
+          setGameMode('PVE');
+      });
+      connection.on('error', (err) => {
+          console.error(err);
+          alert('Lỗi kết nối!');
+      });
+  };
+
+  const handleRemoteMove = (r: number, c: number) => {
+      // Need access to latest state, so we use functional updates in processTurn if needed
+      // But simpler here: get latest board state via ref or relying on closure if component updates
+      // React state closure is tricky. For simplicity, we use the `board` from state but we need to be careful.
+      // Actually, since this is an event handler, it might see stale state.
+      // Best way: Use a ref for the board or simply pass the updater to setBoard.
+      // HOWEVER, `processTurn` needs the CURRENT board.
+      
+      // Let's use a workaround: dispatch an event or use a ref. 
+      // For this specific app structure, let's trust React's rerender for now, 
+      // but note that 'data' listener needs to be refreshed or access refs.
+      // To fix stale closures in `setupConnectionHandlers`, we should use a ref for the handlers or `useEffect` dependency.
+      
+      // FIX: trigger a state update that handles the move
+      setLastRemoteMove({r, c});
+  };
+
+  // Helper to trigger remote move processing when state updates
+  const [lastRemoteMove, setLastRemoteMove] = useState<{r:number, c:number} | null>(null);
+  useEffect(() => {
+      if (lastRemoteMove) {
+          const { r, c } = lastRemoteMove;
+          // Verify it's a valid move (it should be)
+          if (board[r][c] === EMPTY) {
+               const newBoard = board.map(row => [...row]);
+               newBoard[r][c] = currentPlayer;
+               setBoard(newBoard);
+               setLastMove({ r, c });
+               playSound('click');
+               processTurn(newBoard, r, c, currentPlayer, humanColor, scores, turnCount);
+          }
+          setLastRemoteMove(null);
+      }
+  }, [lastRemoteMove]);
+
 
   const processTurn = useCallback((
       newBoard: BoardState, 
@@ -316,9 +427,45 @@ const App = () => {
     
      if (stonesToExplode && stonesToExplode.length > 0) {
        const points = stonesToExplode.length;
-       const isP1Move = playerWhoMoved === currentHumanColor;
+       // Logic for point attribution:
+       // If I moved, and it exploded, OPPONENT gets points.
+       // Who is 'I' in PVE/PVP?
+       // In PVE: isP1Move = playerWhoMoved === currentHumanColor
+       // In ONLINE: P1 is Host, P2 is Guest. 
+       // We track P1/P2 scores directly. 
+       // If PLAYER_BLACK moved -> P1 moved. If PLAYER_WHITE moved -> P2 moved.
        
-       if (isP1Move) {
+       // BUT, due to swapping, Player 1 might be holding White.
+       // Let's rely on who made the move.
+       // We need to know who is 'P1' and who is 'P2' conceptually.
+       // In this game logic:
+       // P1 starts with Black.
+       // P2 starts with White.
+       // When swapped: P1 holds White, P2 holds Black.
+       
+       // Score logic update:
+       // If the player who moved is currently P1 -> P2 gets points.
+       // If the player who moved is currently P2 -> P1 gets points.
+       
+       // Check if the current player (who moved) is P1 or P2.
+       // Logic: 
+       // Initial: P1=Black, P2=White.
+       // Swap 1 (30 moves): P1=White, P2=Black.
+       // Swap 2 (60 moves): P1=Black, P2=White.
+       // So: if (turnCount / 30) is even (0, 2..), P1 is Black.
+       // If (turnCount / 30) is odd (1, 3..), P1 is White.
+       
+       const cycle = Math.floor(currentTurnBase / 30); // Use PREVIOUS turn count for current state
+       const p1IsBlack = cycle % 2 === 0;
+       
+       let isP1 = false;
+       if (p1IsBlack) {
+           if (playerWhoMoved === PLAYER_BLACK) isP1 = true;
+       } else {
+           if (playerWhoMoved === PLAYER_WHITE) isP1 = true;
+       }
+       
+       if (isP1) {
            currentScores.p2 += points;
        } else {
            currentScores.p1 += points;
@@ -337,8 +484,8 @@ const App = () => {
      setScores(currentScores);
      setBoard(updatedBoard);
 
-     const p1Name = gameMode === 'PVE' ? "BẠN" : "NGƯỜI CHƠI 1";
-     const p2Name = gameMode === 'PVE' ? "MÁY" : "NGƯỜI CHƠI 2";
+     const p1Name = gameMode === 'PVE' ? "BẠN" : (gameMode === 'ONLINE' ? "P1 (HOST)" : "NGƯỜI CHƠI 1");
+     const p2Name = gameMode === 'PVE' ? "MÁY" : (gameMode === 'ONLINE' ? "P2 (GUEST)" : "NGƯỜI CHƠI 2");
 
      if (currentScores.p1 >= 200 && (currentScores.p1 - currentScores.p2) >= 100) {
          setFinalResult({ winner: p1Name, reason: "Thắng áp đảo (Hơn 100 điểm & đạt mốc 200)" });
@@ -383,7 +530,20 @@ const App = () => {
 
   const handleCellClick = async (r: number, c: number) => {
     if (isGameOver || isAiThinking) return;
+    
+    // Permission checks
     if (gameMode === 'PVE' && currentPlayer !== humanColor) return;
+    if (gameMode === 'ONLINE') {
+        // Can only move if it's my turn AND the current player matches my assigned color
+        // Note: humanColor updates on Swap. onlinePlayerColor is static (Host=P1, Guest=P2).
+        
+        // We need to check if 'I' am the one who should be moving.
+        // humanColor tracks who 'I' am currently playing as (Black/White).
+        // currentPlayer is whose turn it is (Black/White).
+        // So:
+        if (currentPlayer !== humanColor) return;
+    }
+
     if (board[r][c] !== EMPTY) return;
 
     const newBoard = board.map(row => [...row]);
@@ -392,6 +552,11 @@ const App = () => {
     setBoard(newBoard);
     setLastMove({ r, c });
     playSound('click');
+
+    // Send move if online
+    if (gameMode === 'ONLINE' && conn) {
+        conn.send({ type: 'MOVE', r, c });
+    }
 
     processTurn(newBoard, r, c, currentPlayer, humanColor, scores, turnCount);
   };
@@ -440,7 +605,9 @@ const App = () => {
           <div className="grid grid-cols-2 gap-4">
               <div className={`p-3 rounded-lg border relative overflow-hidden ${humanColor === currentPlayer ? 'border-yellow-500 bg-yellow-900/20' : 'border-gray-700 bg-gray-800'}`}>
                   <div className="flex justify-between items-start mb-2">
-                      <div className="text-xs text-gray-300 font-bold uppercase">{gameMode === 'PVE' ? 'Bạn' : 'P1'}</div>
+                      <div className="text-xs text-gray-300 font-bold uppercase">
+                        {gameMode === 'PVE' ? 'Bạn' : (gameMode === 'ONLINE' ? 'P1 (Host)' : 'P1')}
+                      </div>
                       <div className={`w-4 h-4 rounded-full shadow-sm border border-gray-500 ${humanColor === PLAYER_BLACK ? 'stone-black' : 'stone-white'}`} title="Màu quân hiện tại"></div>
                   </div>
                   <div className="text-4xl font-bold text-white">{scores.p1}</div>
@@ -450,7 +617,9 @@ const App = () => {
 
               <div className={`p-3 rounded-lg border relative overflow-hidden ${humanColor !== currentPlayer ? 'border-yellow-500 bg-yellow-900/20' : 'border-gray-700 bg-gray-800'}`}>
                   <div className="flex justify-between items-start mb-2">
-                       <div className="text-xs text-gray-300 font-bold uppercase">{gameMode === 'PVE' ? 'Máy' : 'P2'}</div>
+                       <div className="text-xs text-gray-300 font-bold uppercase">
+                         {gameMode === 'PVE' ? 'Máy' : (gameMode === 'ONLINE' ? 'P2 (Guest)' : 'P2')}
+                       </div>
                        <div className={`w-4 h-4 rounded-full shadow-sm border border-gray-500 ${humanColor === PLAYER_BLACK ? 'stone-white' : 'stone-black'}`} title="Màu quân hiện tại"></div>
                   </div>
                   <div className="text-4xl font-bold text-white">{scores.p2}</div>
@@ -482,20 +651,29 @@ const App = () => {
 
           {/* Controls */}
           <div className="flex flex-col gap-3">
+            {/* Mode Select */}
             <div className="flex bg-gray-800 rounded-lg p-1">
               <button 
-                onClick={() => { setGameMode('PVE'); resetGame(); }}
+                onClick={() => { setGameMode('PVE'); resetGame(); if(peer) peer.destroy(); setPeer(null); setOnlineStatus('IDLE'); }}
                 className={`flex-1 py-2 rounded text-xs font-bold ${gameMode === 'PVE' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
               >
                 Vs Máy
               </button>
               <button 
-                onClick={() => { setGameMode('PVP'); resetGame(); }}
+                onClick={() => { setGameMode('PVP'); resetGame(); if(peer) peer.destroy(); setPeer(null); setOnlineStatus('IDLE'); }}
                 className={`flex-1 py-2 rounded text-xs font-bold ${gameMode === 'PVP' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
               >
                 2 Người
               </button>
+               <button 
+                onClick={() => { setGameMode('ONLINE'); setOnlineStatus('IDLE'); }}
+                className={`flex-1 py-2 rounded text-xs font-bold ${gameMode === 'ONLINE' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
+              >
+                Online
+              </button>
             </div>
+
+            {/* PVE Settings */}
             {gameMode === 'PVE' && (
               <select 
                 value={difficulty}
@@ -506,6 +684,50 @@ const App = () => {
                 <option value="MEDIUM">Trung Bình</option>
                 <option value="SUPER_STRONG">Siêu Mạnh (Local)</option>
               </select>
+            )}
+
+             {/* Online Settings */}
+            {gameMode === 'ONLINE' && (
+                <div className="bg-gray-800 p-3 rounded-lg border border-gray-700 space-y-3">
+                   {onlineStatus === 'IDLE' && (
+                       <div className="flex gap-2">
+                           <button onClick={() => initOnlineGame(true)} className="flex-1 bg-green-600 hover:bg-green-700 text-white text-xs py-2 rounded font-bold">Tạo Phòng</button>
+                           <div className="flex-1 flex gap-1">
+                                <input 
+                                    type="text" 
+                                    placeholder="Nhập ID"
+                                    value={connectToId}
+                                    onChange={(e) => setConnectToId(e.target.value)}
+                                    className="w-full bg-gray-900 border border-gray-600 rounded px-2 text-xs text-white"
+                                />
+                                <button onClick={() => { const p = new Peer(); setPeer(p); p.on('open', ()=>joinOnlineGame()); }} className="bg-blue-600 px-2 rounded text-white text-xs font-bold">Vào</button>
+                           </div>
+                       </div>
+                   )}
+
+                   {onlineStatus === 'WAITING' && (
+                       <div className="text-center">
+                           <p className="text-xs text-gray-400 mb-1">Mã phòng của bạn:</p>
+                           <div className="flex gap-2 items-center justify-center bg-black/30 p-2 rounded mb-2">
+                               <code className="text-yellow-400 font-mono text-sm">{myPeerId}</code>
+                               <button 
+                                onClick={() => { navigator.clipboard.writeText(window.location.origin + '?join=' + myPeerId); alert('Đã copy link! Gửi cho bạn bè nhé.'); }}
+                                className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-white"
+                               >
+                                   Copy Link
+                               </button>
+                           </div>
+                           <p className="text-xs text-gray-500 animate-pulse">Đang đợi đối thủ...</p>
+                       </div>
+                   )}
+
+                   {onlineStatus === 'CONNECTED' && (
+                       <div className="bg-green-900/30 border border-green-800 p-2 rounded text-center">
+                           <p className="text-green-400 text-xs font-bold">🟢 Đã kết nối!</p>
+                           <p className="text-[10px] text-gray-400 mt-1">Bạn là: {onlinePlayerColor === PLAYER_BLACK ? 'P1 (Host)' : 'P2 (Guest)'}</p>
+                       </div>
+                   )}
+                </div>
             )}
           </div>
 
@@ -568,7 +790,21 @@ const App = () => {
                 const isRemoving = removedStones.some(s => s.r === r && s.c === c);
                 const isLastMove = lastMove?.r === r && lastMove?.c === c;
                 const isHovered = hoveredCell?.r === r && hoveredCell?.c === c;
-                const canMove = cell === EMPTY && !isGameOver && !isAiThinking && (gameMode === 'PVP' || currentPlayer === humanColor);
+                
+                // Allow move if:
+                // 1. Cell is empty
+                // 2. Not game over
+                // 3. Not AI thinking
+                // 4. PVP OR (PVE and my turn) OR (ONLINE and my turn AND I am allowed to move)
+                let canMove = cell === EMPTY && !isGameOver && !isAiThinking;
+                
+                if (canMove) {
+                    if (gameMode === 'PVE') {
+                        if (currentPlayer !== humanColor) canMove = false;
+                    } else if (gameMode === 'ONLINE') {
+                        if (currentPlayer !== humanColor) canMove = false;
+                    }
+                }
 
                 return (
                   <div 
@@ -622,6 +858,16 @@ const App = () => {
     </div>
   );
 };
+
+// Check for join link parameter on load
+const urlParams = new URLSearchParams(window.location.search);
+const joinId = urlParams.get('join');
+// We can auto-populate the join ID if we wanted to, but for now just letting user know
+if(joinId) {
+    // Logic to handle auto join could go here, for now simpler to just let user copy paste or manual entry
+    // Or set initial state for input.
+    // We will do that in component via a prop or ref if needed, but manual entry is safer for this demo.
+}
 
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
